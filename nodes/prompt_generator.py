@@ -1,0 +1,1602 @@
+import requests
+import subprocess
+import time
+import os
+import gc
+import atexit
+import signal
+import psutil
+import json
+import base64
+import shlex
+import ctypes
+import numpy as np
+import torch
+from colorama import Fore, Style
+from PIL import Image
+from io import BytesIO
+from ..py.model_manager import get_local_models, get_model_path, is_model_local, download_model, get_mmproj_path, has_vision_support, resolve_mmproj_choice, get_default_context_size
+
+# Ollama integration
+from ..py.ollama_wrapper import generate_chat as ollama_generate_chat, unload_model as ollama_unload_model
+
+# ComfyUI interrupt helper
+import comfy.model_management
+
+# Try to import preferences cache, fallback to empty dict if not available
+try:
+    from ..py.model_manager import _preferences_cache
+except ImportError:
+    _preferences_cache = {}
+
+# ANSI color codes
+YELLOW     = Fore.YELLOW
+RED        = Fore.RED
+MAGENTA    = Fore.MAGENTA
+GREEN      = Fore.GREEN
+CYAN       = Fore.CYAN
+BLUE       = Fore.BLUE
+RESET      = Style.RESET_ALL
+
+# Global variable to track the server process
+_server_process = None
+_current_model = None
+_current_context_size = None
+_current_launch_sig = None
+_job_handle = None
+_close_llama_on_exit = True
+# Cached per-model sampling defaults (fetched from each model's /props), keyed by
+# model name — so switching models doesn't leak the previous model's defaults.
+_model_default_params = {}
+# Safe built-in fallback used when /props can't be read (e.g. Ollama, or fetch failed).
+_BUILTIN_MODEL_DEFAULTS = {
+    "temperature": 0.7, "top_k": 20, "top_p": 0.9,
+    "min_p": 0.0, "repeat_penalty": 1.0, "presence_penalty": 0.0,
+}
+
+def print_pg_header():
+    """Print the Prompt Generator header"""
+    print(f"{YELLOW}{'=' * 60}{RESET}")
+    print(f"{YELLOW}              Prompt Generator{RESET}")
+    print(f"{YELLOW}{'=' * 60}{RESET}")
+
+def print_pg(message, color=YELLOW):
+    """Print a message with Prompt Generator formatting and YELLOW color"""
+    print(f"{color}{message}{RESET}")
+
+def print_pg_footer():
+    """Print the Prompt Generator footer"""
+    print(f"{YELLOW}{'=' * 60}{RESET}")
+
+def _pg_stream_send(node_id, text, done=False):
+    """Push a live token-stream update to a node's UI (best-effort, no-op on error)."""
+    if node_id is None:
+        return
+    try:
+        import server
+        server.PromptServer.instance.send_sync(
+            "pg-stream", {"node": str(node_id), "text": text, "done": bool(done)}
+        )
+    except Exception:
+        pass
+
+# --- Windows Job Object helpers ---
+def setup_windows_job_object():
+    """Create a Windows Job Object that kills child processes when parent exits"""
+    global _job_handle
+    if os.name != 'nt' or _job_handle:
+        return
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+        JobObjectExtendedLimitInformation = 9
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", ctypes.c_uint32),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", ctypes.c_uint32),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", ctypes.c_uint32),
+                ("SchedulingClass", ctypes.c_uint32),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        extended_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        extended_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+        if not kernel32.SetInformationJobObject(job, JobObjectExtendedLimitInformation, ctypes.byref(extended_info), ctypes.sizeof(extended_info)):
+            kernel32.CloseHandle(job)
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        _job_handle = job
+    except Exception as e:
+        print_pg(f"Warning: Failed to create Job Object: {e}")
+
+def assign_process_to_job(pid):
+    """Assign subprocess pid to job object so it gets killed when parent exits"""
+    global _job_handle
+    if os.name != 'nt' or not _job_handle or not pid:
+        return
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        PROCESS_ALL_ACCESS = 0x1F0FFF
+        proc_handle = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, int(pid))
+        if not proc_handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel32.AssignProcessToJobObject(_job_handle, proc_handle):
+            kernel32.CloseHandle(proc_handle)
+            raise ctypes.WinError(ctypes.get_last_error())
+        kernel32.CloseHandle(proc_handle)
+    except Exception as e:
+        print_pg(f"Warning: Failed to assign process to Job Object: {e}")
+
+# Initialize job object at module load (no-op on non-Windows)
+setup_windows_job_object()
+
+# Cleanup function to stop server on clean exit
+def cleanup_server():
+    """Cleanup function to stop server on exit"""
+    global _server_process, _job_handle, _close_llama_on_exit
+    if _close_llama_on_exit:
+        if _server_process:
+            try:
+                _server_process.terminate()
+                _server_process.wait(timeout=5)
+                print_pg("Server stopped on exit")
+            except Exception:
+                try:
+                    _server_process.kill()
+                except Exception:
+                    pass
+            finally:
+                _server_process = None
+
+        # Close and release Windows Job Object if created
+        if os.name == 'nt' and _job_handle:
+            try:
+                kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+                kernel32.CloseHandle(_job_handle)
+            except Exception:
+                pass
+            _job_handle = None
+
+# Register cleanup for normal interpreter exit. We deliberately do NOT install our own
+# SIGINT/SIGTERM handlers: those are process-global and would override ComfyUI's own
+# shutdown handling. The child llama-server is still reaped on parent death by the Windows
+# Job Object and the Unix PR_SET_PDEATHSIG (set in start_server), so atexit is enough.
+atexit.register(cleanup_server)
+
+# --- Prompt Loading Helpers ---
+_PROMPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "prompts")
+_prompts_cache = {}
+
+def load_prompt(filename):
+    """Load a prompt from a text file in the prompts directory.
+
+    Args:
+        filename: Name of the text file (e.g., 'default_system_prompt.txt')
+
+    Returns:
+        The prompt text, or empty string if file not found
+    """
+    # Check cache first
+    if filename in _prompts_cache:
+        return _prompts_cache[filename]
+
+    filepath = os.path.join(_PROMPTS_DIR, filename)
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            prompt = f.read().strip()
+            _prompts_cache[filename] = prompt
+            return prompt
+    except FileNotFoundError:
+        print_pg(f"Warning: Prompt file not found: {filepath}", RED)
+        return ""
+    except Exception as e:
+        print_pg(f"Warning: Error reading prompt file {filepath}: {e}", RED)
+        return ""
+
+def normalize_timeout(value, default=120, minimum=5):
+    """Coerce a request-timeout value (seconds) to a sane int, shared by both backends
+    and the Pro node. Non-numeric/blank or anything below `minimum` falls back to `default`."""
+    try:
+        secs = int(value) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        secs = default
+    return secs if secs >= minimum else default
+
+
+class PromptGenerator:
+    """Node that generates enhanced prompts using a llama.cpp server"""
+
+    # Server configuration
+    SERVER_PORT = _preferences_cache.get("custom_llama_port", 8080)
+
+    # Prompts are now loaded from external text files in the 'prompts' folder
+    # This makes them easier to edit without modifying Python code
+
+    @staticmethod
+    def get_text_image_system_prompt():
+        """Load the default system prompt for prompt enhancement."""
+        return load_prompt("text_image_system_prompt.txt")
+
+    @staticmethod
+    def get_text_video_system_prompt():
+        """Load the video system prompt."""
+        return load_prompt("text_video_system_prompt.txt")
+
+    @staticmethod
+    def get_image_system_prompt():
+        """Load the system prompt for image description (used with vision models)."""
+        return load_prompt("image_default_system_prompt.txt")
+
+    @staticmethod
+    def get_image_custom_system_prompt():
+        """Load the system prompt for custom image description with user prompt."""
+        return load_prompt("image_custom_system_prompt.txt")
+
+    @staticmethod
+    def get_image_action_prompt():
+        """Load the default image description action prompt."""
+        return load_prompt("image_action_prompt.txt")
+
+    @staticmethod
+    def get_json_system_prompt():
+        """Load the additional instructions for JSON formatted output."""
+        return load_prompt("json_system_prompt.txt")
+
+    @staticmethod
+    def find_vision_model(available_models):
+        """Find the preferred or first available vision-capable model.
+
+        A model is considered vision-capable if it has an mmproj file
+        (either in the registry or on disk).
+        """
+        vision_models = [m for m in available_models if has_vision_support(m)]
+        if not vision_models:
+            return None
+
+        # Predictable fallback: the user's preferred model if it's vision-capable,
+        # otherwise the first available one. (No filename-size guessing — users rename
+        # files, so that heuristic was unreliable. Pick the model in the dropdown for control.)
+        preferred = _preferences_cache.get("preferred_model", "")
+        if preferred and preferred in vision_models:
+            return preferred
+        return vision_models[0]
+
+    @staticmethod
+    def find_text_model(available_models):
+        """Find the preferred or smallest available model for text enhancement.
+
+        Any model can be used for text (vision models work too),
+        but we prefer non-vision models when available to save resources.
+        Falls back to vision-capable models if that's all there is.
+        """
+        # Prefer models without mmproj (lighter weight)
+        text_only = [m for m in available_models if not has_vision_support(m)]
+
+        candidates = text_only if text_only else available_models
+        if not candidates:
+            return None
+
+        # Predictable fallback: preferred model if present, else the first candidate.
+        preferred = _preferences_cache.get("preferred_model", "")
+        if preferred and preferred in candidates:
+            return preferred
+        return candidates[0]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xffffffffffffffff,
+                    "tooltip": "Seed for reproducible generation.",
+                    "control_after_generate": True
+                }),
+            },
+            "optional": {
+                "mode": (["Enhance Prompt (Image)", "Enhance Prompt (Video)", "Analyze Image", "Analyze Image with Prompt"], {
+                    "default": "Enhance Prompt (Image)",
+                    "tooltip": "Choose mode: Enhance text prompt | Analyze image | Analyze image with custom instructions"
+                }),
+                "prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "Enter prompt...",
+                    "tooltip": "Text prompt (required for 'Enhance Prompts', optional for 'Analyze Image with Prompt')"
+                }),
+                "image": ("IMAGE", {
+                    "tooltip": "Connect an image (required for 'Analyze Image' and 'Analyze Image with Prompt' modes)"
+                }),
+                "format_as_json": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Format the output as structured JSON with scene breakdown"
+                }),
+                "enable_thinking": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Enable thinking/reasoning mode for compatible models (DeepSeek format)"
+                }),
+                "stop_server_after": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Stop the llama.cpp server after each prompt (for resource saving, but slower)."
+                }),
+                "clear_vram_on_run": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "Run aggressive VRAM cleanup before and after generation. Disable on high-VRAM GPUs if you want less aggressive cleanup."
+                }),
+                "options": ("OPTIONS", {
+                    "tooltip": "Optional: Connect options node to control model and parameters"
+                })
+            }
+        }
+
+    CATEGORY = "Prompt Manager"
+    DESCRIPTION = "Generate or enhance prompts using a local LLM via llama.cpp or Ollama."
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("output", "thoughts")
+    FUNCTION = "convert_prompt"
+
+    @classmethod
+    def IS_CHANGED(cls, seed, **kwargs):
+        return seed
+
+    @staticmethod
+    def is_server_alive(timeout=0.75):
+        """Check if llama.cpp server is responding. Short timeout by default — this is polled
+        frequently for the status dot, so a dead server must fail fast (a 2s wait used to be felt)."""
+        try:
+            response = requests.get(f"http://localhost:{PromptGenerator.SERVER_PORT}/health", timeout=timeout)
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    @staticmethod
+    def start_server(model_name, context_size=2048, use_vision_model=False, mmproj_override=None, extra_launch_args=None):
+        """Start llama.cpp server with specified model
+
+        Args:
+            model_name: Name of the model to use
+            context_size: Context size (default 2048)
+            use_vision_model: Whether to use the vision model's mmproj
+
+        Returns:
+            tuple: (success: bool, error_message: str or None)
+        """
+        global _server_process, _current_model, _current_context_size, _job_handle, _close_llama_on_exit, _current_launch_sig
+
+        # Set the close preference for cleanup
+        _close_llama_on_exit = _preferences_cache.get("close_llama_on_exit", True)
+        # Extra launch args: the node's field wins; if empty, fall back to the global setting.
+        node_args = (extra_launch_args or "").strip()
+        custom_args_str = node_args if node_args else (_preferences_cache.get("custom_llama_args", "") or "")
+
+        # Resolve the mmproj up-front so the reuse signature is accurate. This is the
+        # same resolution used later when building the launch command.
+        resolved_mmproj = None
+        skip_mmproj = False
+        if use_vision_model:
+            if mmproj_override == "None":
+                skip_mmproj = True
+            else:
+                if mmproj_override and mmproj_override not in ("auto", "None"):
+                    resolved_mmproj = resolve_mmproj_choice(mmproj_override)
+                if not resolved_mmproj:
+                    resolved_mmproj = get_mmproj_path(model_name)
+
+        # A signature capturing everything that affects the launched process. If it
+        # matches a healthy running server, we reuse it instead of reloading the model.
+        launch_sig = (
+            model_name,
+            int(context_size),
+            bool(use_vision_model),
+            (resolved_mmproj or ("skip" if skip_mmproj else "none")),
+            custom_args_str,
+        )
+
+        # Reuse an already-running server with the identical launch signature.
+        # (This is the big win: avoids reloading the whole model on every run.)
+        if (_server_process is not None
+                and _current_launch_sig == launch_sig
+                and PromptGenerator.is_server_alive()):
+            print_pg(f"Reusing running server for model: {model_name}")
+            return (True, None)
+
+        # We need a (re)start. Clean up our server plus any orphaned llama-server
+        # processes, then continue to launch a fresh one.
+        PromptGenerator.kill_all_llama_servers()
+        if _server_process:
+            PromptGenerator.stop_server()
+
+        # Check if model needs to be downloaded
+        if not is_model_local(model_name):
+            print_pg(f"Model '{model_name}' not found locally, downloading from HuggingFace...")
+            try:
+                model_path = download_model(model_name)
+                if not model_path:
+                    error_msg = "Error: Failed to download model"
+                    print_pg(error_msg, RED)
+                    return (False, error_msg)
+                print_pg(f"Download complete: {model_path}")
+            except Exception as e:
+                error_msg = f"Error downloading model: {e}"
+                print_pg(error_msg, RED)
+                return (False, error_msg)
+        else:
+            model_path = get_model_path(model_name)
+
+        if not os.path.exists(model_path):
+            error_msg = f"Error: Model file not found: {model_path}"
+            print_pg(error_msg, RED)
+            return (False, error_msg)
+
+        try:
+            print_pg(f"Starting server with model: {model_name}")
+
+            # Determine the correct llama-server executable based on OS
+            if os.name == 'nt':  # Windows
+                server_cmd = "llama-server.exe"
+                creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            else:  # Linux/Mac
+                server_cmd = "llama-server"
+                creation_flags = 0
+
+            # If custom llama path is set, use it. Accepts either a full path to the
+            # executable (e.g. I:\\llama.cpp\\llama-server.exe) or a directory that
+            # contains llama-server(.exe).
+            custom_llama_path = _preferences_cache.get("custom_llama_path", "")
+            if custom_llama_path:
+                custom_llama_path = os.path.normpath(custom_llama_path)
+                if os.path.isfile(custom_llama_path):
+                    print_pg(f"Using custom llama-server executable: {custom_llama_path}")
+                    server_cmd = custom_llama_path
+                elif os.path.isdir(custom_llama_path):
+                    print_pg(f"Using custom llama path: {custom_llama_path}")
+                    server_cmd = os.path.join(custom_llama_path, server_cmd)
+                else:
+                    error_msg = f"Error: Custom llama path is not a valid file or directory: {custom_llama_path}\nWill use system PATH instead."
+                    print_pg(error_msg, RED)
+
+            # Build command arguments
+            cmd_args = [
+                server_cmd,
+                "-m", model_path,
+                "--port", str(PromptGenerator.SERVER_PORT),
+                "--no-warmup",
+                "--ctx-size", str(context_size),
+                "--batch-size", "1024",
+                "--ubatch-size", "1024",
+                "--cache-type-k", "q4_0",
+                "--cache-type-v", "q4_0",
+                "--parallel", "1",
+            ]
+
+            # GPU-specific tuning flags
+            if torch.cuda.is_available():
+                cmd_args.extend([
+                    "--n-gpu-layers", "999",
+                    "--flash-attn", "on",
+                ])
+            else:
+                cmd_args.extend(["--n-gpu-layers", "0"])
+
+            # Compatibility fallback for older llama-server builds that don't
+            # support newer tuning flags.
+            cmd_args_fallback = [
+                server_cmd,
+                "-m", model_path,
+                "--port", str(PromptGenerator.SERVER_PORT),
+                "--no-warmup",
+                "-ngl", "100",
+                "-c", str(context_size),
+            ]
+
+            # Add vision flags for models with mmproj (resolved earlier into resolved_mmproj/skip_mmproj)
+            if use_vision_model:
+                if skip_mmproj:
+                    print_pg("mmproj set to 'None': skipping vision projector (no --mmproj).", YELLOW)
+                elif resolved_mmproj:
+                    print_pg(f"Vision model: using mmproj: {os.path.basename(resolved_mmproj)}")
+                    cmd_args.extend(["--mmproj", resolved_mmproj])
+                    cmd_args_fallback.extend(["--mmproj", resolved_mmproj])
+                else:
+                    error_msg = f"Error: Vision mode requires an mmproj file for '{model_name}' but none was found.\nPlease ensure an mmproj file exists, or use the Generator Options node to download a vision-capable model."
+                    print_pg(error_msg, RED)
+                    return (False, error_msg)
+
+            # Append user-provided extra args LAST so they override the addon's
+            # defaults (llama.cpp uses the last value for a repeated flag).
+            if custom_args_str.strip():
+                try:
+                    # posix=False keeps Windows backslashes intact but leaves quotes
+                    # attached to tokens, so strip a matching surrounding pair.
+                    extra_args = []
+                    for a in shlex.split(custom_args_str, posix=False):
+                        if len(a) >= 2 and a[0] == a[-1] and a[0] in ('"', "'"):
+                            a = a[1:-1]
+                        extra_args.append(a)
+                    cmd_args.extend(extra_args)
+                    cmd_args_fallback.extend(extra_args)
+                    print_pg(f"Appending extra llama-server args: {' '.join(extra_args)}")
+                except ValueError as e:
+                    print_pg(f"Could not parse 'Extra llama-server args' ({e}); ignoring them.", YELLOW)
+
+            # Prepare popen kwargs for cross-platform parent-death behavior
+            popen_kwargs = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+            }
+
+            if os.name == 'nt':
+                popen_kwargs["creationflags"] = creation_flags
+            else:
+                # On Unix, set PR_SET_PDEATHSIG so child gets SIGTERM when parent dies
+                if _close_llama_on_exit:
+                    def _set_pdeathsig():
+                        try:
+                            # Try common libc names
+                            for libname in ("libc.so.6", "libc.dylib", "libc.so"):
+                                try:
+                                    libc = ctypes.CDLL(libname)
+                                    break
+                                except Exception:
+                                    libc = None
+                            if not libc:
+                                return
+                            PR_SET_PDEATHSIG = 1
+                            libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+                        except Exception:
+                            return
+
+                    popen_kwargs["preexec_fn"] = _set_pdeathsig
+
+            def _launch_and_wait(args):
+                global _server_process, _current_model, _current_context_size, _current_launch_sig
+
+                _server_process = subprocess.Popen(args, **popen_kwargs)
+
+                # On Windows attach process to Job Object so children die if parent exits
+                if os.name == 'nt' and _close_llama_on_exit:
+                    try:
+                        setup_windows_job_object()
+                        assign_process_to_job(_server_process.pid)
+                    except Exception as e:
+                        print_pg(f"Warning: Failed to assign process to Job Object: {e}")
+
+                _current_model = model_name
+                _current_context_size = context_size
+                _current_launch_sig = launch_sig
+
+                # Wait for server to be ready
+                for _ in range(60):  # Wait up to 60 seconds
+                    time.sleep(1)
+                    try:
+                        comfy.model_management.throw_exception_if_processing_interrupted()
+                    except Exception:
+                        # Propagate interrupt up to caller
+                        raise
+
+                    # Check if process has crashed
+                    if _server_process.poll() is not None:
+                        stderr_output = ""
+                        try:
+                            stderr_output = _server_process.stderr.read().decode("utf-8", errors="replace").strip()
+                        except Exception:
+                            pass
+                        error = f"Error: llama-server exited with code {_server_process.returncode}"
+                        if stderr_output:
+                            last_lines = "\n".join(stderr_output.splitlines()[-5:])
+                            error += f"\n{last_lines}"
+                        _server_process = None
+                        _current_model = None
+                        _current_context_size = None
+                        _current_launch_sig = None
+                        return (False, error, stderr_output)
+
+                    if PromptGenerator.is_server_alive():
+                        return (True, None, "")
+
+                error = "Error: Server did not start in time (60s)"
+                PromptGenerator.stop_server()
+                return (False, error, "")
+
+            def _is_unsupported_flag_error(stderr_output):
+                text = (stderr_output or "").lower()
+                if not text:
+                    return False
+                markers = [
+                    "unknown argument",
+                    "unknown option",
+                    "unrecognized option",
+                    "unrecognized arguments",
+                    "invalid argument",
+                    "invalid option",
+                ]
+                return any(m in text for m in markers)
+
+            success, error_msg, stderr_output = _launch_and_wait(cmd_args)
+            if success:
+                return (True, None)
+
+            # Retry with conservative args if this looks like a flag-compatibility issue.
+            if _is_unsupported_flag_error(stderr_output):
+                print_pg("Warning: llama-server rejected one or more advanced launch flags. Retrying with compatibility mode.", YELLOW)
+                success, fallback_error, _ = _launch_and_wait(cmd_args_fallback)
+                if success:
+                    return (True, None)
+                print_pg(fallback_error, RED)
+                return (False, fallback_error)
+
+            print_pg(error_msg, RED)
+            return (False, error_msg)
+
+        except FileNotFoundError:
+            error_msg = "Error: llama-server command not found. Please install llama.cpp and add to PATH.\nInstallation guide: https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md"
+            print_pg(error_msg, RED)
+            return (False, error_msg)
+        except Exception as e:
+            error_msg = f"Error starting server: {e}"
+            print_pg(error_msg, RED)
+            return (False, error_msg)
+
+    @staticmethod
+    def kill_all_llama_servers():
+        """Kill all llama-server processes using OS commands"""
+        try:
+            # Find and kill all llama-server processes
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    # Check if process is llama-server
+                    if proc.info['name'] and 'llama-server' in proc.info['name'].lower():
+                        print_pg(f"Killing llama-server process (PID: {proc.info['pid']})")
+                        proc.kill()
+                        proc.wait(timeout=3)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+                    pass
+        except Exception as e:
+            print_pg(f"Error killing llama-server processes: {e}", RED)
+
+    @staticmethod
+    def stop_server():
+        """Stop the llama.cpp server"""
+        global _server_process, _current_model, _job_handle, _current_launch_sig
+
+        if _server_process:
+            try:
+                print_pg("Server stopped")
+                _server_process.terminate()
+                _server_process.wait(timeout=5)
+            except Exception:
+                try:
+                    _server_process.kill()
+                except Exception:
+                    pass
+            finally:
+                _server_process = None
+                _current_model = None
+                _current_launch_sig = None
+
+        # Close and release Windows Job Object if created
+        if os.name == 'nt' and _job_handle:
+            try:
+                kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+                kernel32.CloseHandle(_job_handle)
+            except Exception:
+                pass
+            _job_handle = None
+
+        # Also kill any orphaned llama-server processes
+        PromptGenerator.kill_all_llama_servers()
+
+    def _get_token_counts_parallel(self, system_prompt, user_prompt):
+        """Get token counts for system and user prompts in parallel using threads"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        results = {"system": None, "user": None}
+
+        def tokenize_system():
+            return self.count_tokens(system_prompt)
+
+        def tokenize_user():
+            return self.count_tokens(user_prompt)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_sys = executor.submit(tokenize_system)
+                future_usr = executor.submit(tokenize_user)
+
+                results["system"] = future_sys.result(timeout=15)
+                results["user"] = future_usr.result(timeout=15)
+        except Exception as e:
+            print_pg(f"Warning: Parallel tokenization failed: {e}")
+
+        return results
+
+    def count_tokens(self, text):
+        """Get exact token count for text using server's tokenize endpoint"""
+        try:
+            response = requests.post(
+                f"http://localhost:{self.SERVER_PORT}/tokenize",
+                json={"content": text},
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return len(data.get("tokens", []))
+        except Exception as e:
+            print_pg(f"Warning: Could not tokenize: {e}")
+        return None
+
+    @staticmethod
+    def fetch_model_defaults():
+        """Fetch the currently-loaded model's default generation params and cache them
+        under that model's name (so a later model switch gets its own, not these)."""
+        key = _current_model  # the model the running server actually loaded
+        try:
+            response = requests.get(f"http://localhost:{PromptGenerator.SERVER_PORT}/props", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                params = data.get("default_generation_settings", {}).get("params", {})
+                defaults = {
+                    "temperature": round(params.get("temperature", 0.7), 4),
+                    "top_k": int(params.get("top_k", 20)),
+                    "top_p": round(params.get("top_p", 0.9), 4),
+                    "min_p": round(params.get("min_p", 0.0), 4),
+                    "repeat_penalty": round(params.get("repeat_penalty", 1.0), 4),
+                    "presence_penalty": round(params.get("presence_penalty", 0.0), 4),
+                }
+                _model_default_params[key] = defaults
+                return defaults
+        except Exception:
+            pass
+        defaults = dict(_BUILTIN_MODEL_DEFAULTS)
+        _model_default_params[key] = defaults
+        return defaults
+
+    @staticmethod
+    def get_model_defaults():
+        """Return the current model's cached defaults, or fetch them if not cached yet."""
+        cached = _model_default_params.get(_current_model)
+        if cached is not None:
+            return cached
+        # fetch_model_defaults() falls back to built-in defaults on error, always a dict.
+        return PromptGenerator.fetch_model_defaults()
+
+    @staticmethod
+    def _comfy_cache_cleanup_compat(force=True):
+        """Call Comfy cache cleanup with compatibility across versions."""
+        if hasattr(comfy.model_management, "soft_empty_cache"):
+            try:
+                # Newer Comfy builds may accept a force flag.
+                comfy.model_management.soft_empty_cache(force)
+            except TypeError:
+                # Older builds expose no-arg soft_empty_cache.
+                comfy.model_management.soft_empty_cache()
+        elif hasattr(comfy.model_management, "cleanup_models"):
+            comfy.model_management.cleanup_models()
+
+    @staticmethod
+    def flush_vram(unload_models=True):
+        """Aggressive VRAM cleanup for low-headroom systems."""
+        try:
+            if unload_models and hasattr(comfy.model_management, "unload_all_models"):
+                comfy.model_management.unload_all_models()
+
+            PromptGenerator._comfy_cache_cleanup_compat(force=True)
+            gc.collect()
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+
+            print_pg(f"VRAM flush executed (unload_models={'ON' if unload_models else 'OFF'}).")
+        except Exception as e:
+            print_pg(f"Warning: VRAM flush failed: {e}", RED)
+
+    @staticmethod
+    def cleanup_vram_before_run():
+        """Aggressive pre-run VRAM cleanup before generation starts."""
+        PromptGenerator.flush_vram(unload_models=True)
+
+    def _consume_chat_stream(self, response, show_everything_in_console):
+        """Consume an OpenAI-style streamed chat completion (shared by the llama.cpp and
+        Ollama paths). Accumulates the answer and any reasoning, pushes throttled live
+        updates to the node UI, and optionally echoes to the console.
+
+        Returns (full_response, thinking_content, usage_stats). Raises on user interrupt
+        (after closing the response) so the caller can handle it.
+        """
+        full_response = ""
+        thinking_content = ""
+        usage_stats = None
+        first_thinking = True
+        first_content = True
+
+        for line in response.iter_lines():
+            # Check for user interrupt from ComfyUI; close the response and propagate it.
+            try:
+                comfy.model_management.throw_exception_if_processing_interrupted()
+            except Exception:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                raise
+            if not line:
+                continue
+            line = line.decode('utf-8')
+            if not line.startswith('data: '):
+                continue
+            data = line[6:]  # Remove 'data: ' prefix
+            if data == '[DONE]':
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+
+            # Extract usage if present (usually in the final chunk).
+            if "usage" in chunk:
+                usage_stats = chunk["usage"]
+
+            if not (chunk.get('choices') and len(chunk['choices']) > 0):
+                continue
+            delta = chunk['choices'][0].get('delta', {})
+
+            # Stream reasoning_content ("thinking") — only until the real answer starts,
+            # so the final box ends up holding content only.
+            reasoning_delta = delta.get('reasoning_content')
+            if reasoning_delta is not None:
+                thinking_content += str(reasoning_delta)
+                _nid = getattr(self, "_pg_node_id", None)
+                if _nid is not None and not full_response:
+                    _now = time.time()
+                    if _now - getattr(self, "_pg_stream_t", 0.0) > 0.08:
+                        self._pg_stream_t = _now
+                        _pg_stream_send(_nid, "💭 " + thinking_content)
+                if show_everything_in_console:
+                    if first_thinking:
+                        print_pg("\n--------- THINKING ---------", GREEN)
+                        first_thinking = False
+                    print(f"{GREEN}{str(reasoning_delta)}{RESET}", end='', flush=True)
+
+            # Stream content (final answer), throttled to the node UI.
+            content_delta = delta.get('content')
+            if content_delta is not None:
+                full_response += str(content_delta)
+                _nid = getattr(self, "_pg_node_id", None)
+                if _nid is not None:
+                    _now = time.time()
+                    if _now - getattr(self, "_pg_stream_t", 0.0) > 0.08:
+                        self._pg_stream_t = _now
+                        _pg_stream_send(_nid, full_response)
+                if show_everything_in_console:
+                    if first_content:
+                        print_pg("\n\n--------- FINAL ANSWER ---------", CYAN)
+                        first_content = False
+                    print(f"{CYAN}{str(content_delta)}{RESET}", end='', flush=True)
+
+        _pg_stream_send(getattr(self, "_pg_node_id", None), full_response, done=True)
+        return full_response, thinking_content, usage_stats
+
+    def convert_prompt(self, seed: int, mode="Enhance Prompt (Image)", prompt="", image=None, format_as_json=False, enable_thinking=True, stop_server_after=True, clear_vram_on_run=True, options=None, prior_output=None, **kwargs) -> tuple:
+        """Convert prompt using llama.cpp server or Ollama, with caching for repeated requests."""
+        global _current_model
+
+        print_pg_header()  # Print header for this execution
+        if clear_vram_on_run:
+            self.cleanup_vram_before_run()
+        else:
+            print_pg("Skipping aggressive VRAM cleanup before run (clear_vram_on_run=False).")
+
+        # Determine LLM backend: "ollama" or "llama.cpp".
+        # The options node's backend (set per-node from the Options > LLM > Backend
+        # selector) is the ULTIMATE decider and overrides everything else. Only when
+        # the options carry no explicit backend do we fall back to the global setting.
+        opt_backend = options.get("llm_backend") if options else None
+        if opt_backend in ("ollama", "llama.cpp"):
+            use_ollama = (opt_backend == "ollama")
+        else:
+            use_ollama = _preferences_cache.get("llm_backend", "llama.cpp") == "ollama"
+
+        # Per-node generation request timeout (seconds), shared by both backends.
+        req_timeout = normalize_timeout(options.get("request_timeout") if options else None)
+
+        # Extract console option from connected options node
+        show_everything_in_console = False  # Default to False when options not connected
+        use_model_default_sampling = True   # Default to using model defaults
+        use_vision_model = False            # Default to False, set to True for vision modes
+
+        if options and "show_everything_in_console" in options:
+            show_everything_in_console = options["show_everything_in_console"]
+        if options and "use_model_default_sampling" in options:
+            use_model_default_sampling = options["use_model_default_sampling"]
+
+        if mode in ["Analyze Image", "Analyze Image with Prompt"] or (mode == "Enhance Prompt (Video)" and image is not None):
+            use_vision_model = True
+
+        # Validate inputs based on mode
+        if mode == "Enhance Prompt (Image)" and not prompt.strip():
+            error_msg = "Did you perhaps forget to enter a User Prompt?"
+            print_pg(error_msg, RED)
+            raise RuntimeError(error_msg)
+
+        if mode == "Enhance Prompt (Video)" and not prompt.strip() and image is None:
+            error_msg = "Did you perhaps forget to enter a User Prompt?"
+            print_pg(error_msg, RED)
+            raise RuntimeError(error_msg)
+
+        # Always determine a valid model filename before running server
+        model_to_use = None
+
+        # ── Preferred model from ComfyUI settings (fallback when Options node model is not set) ──
+        _preferred = _preferences_cache.get("preferred_model", "").strip()
+
+        if use_ollama:
+            # ── Ollama model selection ──
+            # Priority: Options node > preferences > auto-discover from Ollama
+            if options and "model" in options:
+                model_to_use = options["model"]
+                print_pg(f"Using model from options node: {model_to_use}")
+            elif _preferred:
+                model_to_use = _preferred
+                print_pg(f"Using preferred model from settings: {model_to_use}")
+            else:
+                # Auto-discover available models from Ollama
+                from ..py.ollama_wrapper import discover_ollama_models
+                discovered, status = discover_ollama_models(_preferences_cache)
+                if discovered:
+                    model_to_use = discovered[0]
+                    print_pg(f"Auto-selected Ollama model: {model_to_use}")
+                else:
+                    error_msg = (f"Error: No Ollama model available. {status}\n"
+                                 "Pull a model first (e.g. `ollama pull llama3.1`).")
+                    print_pg(error_msg, RED)
+                    raise RuntimeError(error_msg)
+
+            print_pg("Backend       : Ollama")
+
+        else:
+            # ── llama.cpp model selection ──
+            print_pg("Backend       : llama.cpp")
+            available_models = get_local_models()
+
+            if use_vision_model:
+                # Priority: Options node > preferences > auto-discover
+                if options and "model" in options and has_vision_support(options["model"]) and is_model_local(options["model"]):
+                    model_to_use = options["model"]
+                    print_pg(f"Using vision model from options node: {model_to_use}")
+                elif options and "model" in options and is_model_local(options["model"]):
+                    # Selected model doesn't support vision
+                    print_pg(f"Warning: Model '{options['model']}' has no mmproj (no vision support) but '{mode}' mode is active.\nIgnoring model selection and searching for a vision-capable model.")
+                    model_to_use = self.find_vision_model(available_models)
+                    if model_to_use is None:
+                        error_msg = f"Error: '{mode}' mode requires a vision model (one with an mmproj file). Please download a vision-capable model via the Options node."
+                        print_pg(error_msg, RED)
+                        raise RuntimeError(error_msg)
+                elif _preferred and is_model_local(_preferred):
+                    if has_vision_support(_preferred):
+                        model_to_use = _preferred
+                        print_pg(f"Using preferred model from settings: {model_to_use}")
+                    else:
+                        print_pg(f"Warning: Preferred model '{_preferred}' has no mmproj (no vision support) for '{mode}' mode.\nSearching for a vision-capable model.")
+                        model_to_use = self.find_vision_model(available_models)
+                        if model_to_use is None:
+                            error_msg = f"Error: '{mode}' mode requires a vision model (one with an mmproj file). Please download a vision-capable model via the Options node."
+                            print_pg(error_msg, RED)
+                            raise RuntimeError(error_msg)
+                else:
+                    # Try to find a vision model automatically
+                    model_to_use = self.find_vision_model(available_models)
+                    if model_to_use is None:
+                        error_msg = f"Error: '{mode}' mode requires a vision model (one with an mmproj file). Please download a vision-capable model via the Options node."
+                        print_pg(error_msg, RED)
+                        raise RuntimeError(error_msg)
+            else:
+                # Enhance Prompt mode - any model works, prefer text-only for efficiency
+                # Priority: Options node > preferences > auto-select
+                if options and "model" in options and is_model_local(options["model"]):
+                    model_to_use = options["model"]
+                    print_pg(f"Using model from options node: {model_to_use}")
+                elif _preferred and is_model_local(_preferred):
+                    model_to_use = _preferred
+                    print_pg(f"Using preferred model from settings: {model_to_use}")
+                else:
+                    if not available_models:
+                        error_msg = "Error: No models found in models/ folder. Please add a .gguf model or use Generator Options node to download one."
+                        print_pg(error_msg, RED)
+                        raise RuntimeError(error_msg)
+                    model_to_use = self.find_text_model(available_models)
+                    if not model_to_use:
+                        error_msg = "Error: No suitable model found. Please add a .gguf model or use the Generator Options node to download one."
+                        print_pg(error_msg, RED)
+                        raise RuntimeError(error_msg)
+
+            # Thinking mode is only meaningful if the model explicitly supports it
+            # (no longer tied to Qwen3VL naming — generic check)
+            # Users can always enable thinking; the model will simply ignore it if unsupported.
+
+        print_pg(f"Vision mode   : {'ON' if use_vision_model else 'OFF'}")
+        print_pg(f"Thinking mode : {'ON' if enable_thinking else 'OFF'}")
+        print_pg(f"Using Model   : {model_to_use}")
+
+        # Prepare images for vision modes (needed for cache key)
+        images = None
+        if use_vision_model:
+            # Gather all images: main image plus up to 4 extra from options
+            images = []
+            if image is not None:
+                images.append(image)
+            # Check for extra images in options (image2-5)
+            if options:
+                for key in ["image2", "image3", "image4", "image5"]:
+                    img = options.get(key, None)
+                    if img is not None:
+                        images.append(img)
+
+            if not images:
+                error_msg = f"Error: '{mode}' mode requires at least one image to be connected. Please connect an image or switch to 'Enhance Prompt' mode."
+                print_pg(error_msg, RED)
+                raise RuntimeError(error_msg)
+
+        # If the current model is not the one we want, or server is not running, restart
+        # Also restart if context_size has changed (llama.cpp only)
+        context_size = options.get("context_size", get_default_context_size()) if options else get_default_context_size()
+        if not use_ollama:
+            if _current_model != model_to_use or _current_context_size != context_size or not self.is_server_alive():
+                self.stop_server()
+                # Get context_size from options or use default
+                success, error_msg = self.start_server(model_to_use, context_size, use_vision_model, options.get("mmproj") if options else None, options.get("extra_launch_args") if options else None)
+                if not success:
+                    raise RuntimeError(error_msg)
+
+        # Build the endpoint URL
+        full_url = f"http://localhost:{self.SERVER_PORT}/v1/chat/completions"
+
+        # Prepare the system prompt
+        if mode == "Analyze Image":
+            base_system_prompt = self.get_image_system_prompt()
+        elif mode == "Analyze Image with Prompt":
+            base_system_prompt = self.get_image_custom_system_prompt()
+        elif mode == "Enhance Prompt (Video)":
+            base_system_prompt = self.get_text_video_system_prompt()
+        else:
+            base_system_prompt = self.get_text_image_system_prompt()
+
+        # Optional override from Prompt Generator Options node (already resolved there).
+        override_prompt = str(options.get("override_system_prompt_text", "") or "").strip() if options else ""
+        if override_prompt:
+            base_system_prompt = override_prompt
+
+        if options and "system_prompt" in options:
+            custom_sp = options["system_prompt"]
+            sp_mode = options.get("system_prompt_mode", "replace")
+            if sp_mode == "append":
+                system_prompt = base_system_prompt + "\n\n" + custom_sp
+            else:
+                system_prompt = custom_sp
+        else:
+            system_prompt = base_system_prompt
+
+        # Add JSON formatting instructions only when `format_as_json` is True
+        if format_as_json:
+            system_prompt = system_prompt + self.get_json_system_prompt()
+
+        # "No system prompt" — drop it entirely, overriding box/default/mode prompt.
+        # An empty system_prompt below omits the system message from the request.
+        if options and options.get("no_system_prompt"):
+            system_prompt = ""
+
+        # Determine user content based on mode
+        if mode == "Analyze Image":
+            user_content = self.get_image_action_prompt()
+        elif mode == "Analyze Image with Prompt":
+            # Use user prompt if provided, otherwise default to generic description
+            user_content = prompt.strip() if prompt.strip() else self.get_image_action_prompt()
+        else:
+            user_content = prompt
+
+        # Refine mode: revise a previous result. The system prompt (format/style)
+        # stays in force; we hand the model its prior output + the change to apply.
+        if prior_output:
+            user_content = (
+                "Here is the previous result:\n\n"
+                + str(prior_output).strip()
+                + "\n\n---\nApply the following change and return the FULL revised result "
+                + "in the same format (not a diff, no commentary):\n"
+                + (user_content or "").strip()
+            )
+
+        # === TOKENIZATION (only for non-cached requests, llama.cpp only) ===
+        cached_token_counts = None
+        if show_everything_in_console and not use_ollama:
+            cached_token_counts = self._get_token_counts_parallel(system_prompt, user_content)
+
+        # If in vision mode, encode images for the request
+        if use_vision_model:
+            image_contents = []
+            for idx, img_tensor_batch in enumerate(images):
+                # ComfyUI images are in format (batch, height, width, channels) with values 0-1
+                img_tensor = img_tensor_batch[0]  # Get first image from batch
+                img_np = (img_tensor.cpu().numpy() * 255).astype(np.uint8)
+                pil_image = Image.fromarray(img_np)
+
+                # Resize to ~2 megapixels if larger (to reduce context usage)
+                width, height = pil_image.size
+                total_pixels = width * height
+                max_pixels = 2000000  # 2 megapixels
+
+                if total_pixels > max_pixels:
+                    # Calculate scaling factor to get ~2 megapixels
+                    scale = (max_pixels / total_pixels) ** 0.5
+                    new_width = int(width * scale)
+                    new_height = int(height * scale)
+                    print_pg(f"Resizing image {idx + 1} from {width}x{height} to {new_width}x{new_height} (~2MP)")
+                    pil_image = pil_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                else:
+                    print_pg(f"Image {idx + 1} size is {width}x{height}, no resizing needed")
+
+                # Encode to base64
+                buffered = BytesIO()
+                pil_image.save(buffered, format="PNG")
+                img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                image_contents.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}})
+
+            # Vision format: all images first, then text
+            user_message = {
+                "role": "user",
+                "content": image_contents + [{"type": "text", "text": user_content}]
+            }
+        else:
+            user_message = {"role": "user", "content": user_content}
+
+        # ================================================================
+        # Ollama generation path
+        # ================================================================
+        if use_ollama:
+            return self._generate_via_ollama(
+                model_to_use=model_to_use,
+                system_prompt=system_prompt,
+                user_message=user_message,
+                user_content=user_content,
+                seed=seed,
+                enable_thinking=enable_thinking,
+                use_model_default_sampling=use_model_default_sampling,
+                show_everything_in_console=show_everything_in_console,
+                stop_server_after=stop_server_after,
+                clear_vram_on_run=clear_vram_on_run,
+                options=options,
+                images=images,
+                context_size=context_size,
+                prompt=prompt,
+                format_as_json=format_as_json,
+            )
+
+        # ================================================================
+        # llama.cpp generation path (existing)
+        # ================================================================
+        # Omit the system message entirely when there is no system prompt.
+        _messages = []
+        if system_prompt:
+            _messages.append({"role": "system", "content": system_prompt})
+        _messages.append(user_message)
+        payload = {
+            "messages": _messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "seed": seed,
+            "chat_template_kwargs": {
+                "enable_thinking": enable_thinking
+            }
+        }
+
+        if format_as_json:
+            payload["response_format"] = {"type": "json_object"}
+
+        model_defaults = self.get_model_defaults()
+
+        if options and not use_model_default_sampling:
+            # Override model defaults with any options provided
+            for param in ["temperature", "top_k", "top_p", "min_p", "repeat_penalty", "presence_penalty"]:
+                # we default to model defaults if option not provided
+                payload[param] = options.get(param, model_defaults.get(param))
+        else:
+            # Use model defaults
+            for param in ["temperature", "top_k", "top_p", "min_p", "repeat_penalty", "presence_penalty"]:
+                payload[param] = model_defaults.get(param)
+
+        # Never send a null sampling value to llama.cpp (it expects numbers and may
+        # reject the whole request). Coerce any None back to the model default.
+        for param in ["temperature", "top_k", "top_p", "min_p", "repeat_penalty", "presence_penalty"]:
+            if payload.get(param) is None:
+                payload[param] = model_defaults.get(param)
+
+        # presence_penalty is a no-op at 0.0. Omit it when 0/None so the request is
+        # byte-identical to the original behavior and older llama-server builds that
+        # don't accept the field are unaffected. It's only sent when actually set.
+        if not payload.get("presence_penalty"):
+            payload.pop("presence_penalty", None)
+
+        # Now that payload is ready, print it if requested
+        # Debug output if requested
+        if show_everything_in_console:
+            print_pg(f"{'=' * 60}", GREEN)
+            print_pg("           DETAILED INFORMATION ENABLED", GREEN)
+            print_pg(f"{'=' * 60}", GREEN)
+            print_pg("------ GENERATION PARAMETERS ------", GREEN)
+            for param in ["seed", "temperature", "top_k", "top_p", "min_p", "repeat_penalty", "presence_penalty"]:
+                print_pg(f"{param} = {payload.get(param, '(default)')}", GREEN)
+            print_pg("\n--------- SYSTEM PROMPT ---------", GREEN)
+            print_pg(f"{system_prompt}", GREEN)
+            print_pg("\n--------- USER PROMPT ---------", GREEN)
+            print_pg(f"{user_content}", GREEN)
+        response = None
+        try:
+            response = requests.post(
+                full_url,
+                json=payload,
+                timeout=req_timeout,
+                stream=True  # Always stream for proper response handling
+            )
+
+            # Handle 500 server error by restarting server and retrying once
+            if response.status_code == 500:
+                print_pg("Server error 500, restarting server and retrying...", RED)
+                self.stop_server()
+                success, error_msg = self.start_server(model_to_use, context_size, use_vision_model, options.get("mmproj") if options else None, options.get("extra_launch_args") if options else None)
+                if success:
+                    response = requests.post(
+                        full_url,
+                        json=payload,
+                        timeout=req_timeout,
+                        stream=True
+                    )
+                else:
+                    raise RuntimeError(error_msg)
+
+            response.raise_for_status()
+
+            # Handle streaming response (always streamed now).
+            full_response, thinking_content, usage_stats = self._consume_chat_stream(
+                response, show_everything_in_console)
+            if show_everything_in_console:
+                print('')  # Final newline after streaming
+
+            if not show_everything_in_console:
+                print_pg("Prompt generation complete.")
+
+            # Log token usage if available
+            if show_everything_in_console:
+                if usage_stats:
+                    self.print_token_stats(usage_stats, cached_token_counts, thinking_content, full_response, images)
+            else:
+                print_pg_footer()
+
+            if not full_response:
+                # If we received no content, check usage stats to see if we exhausted the context
+                if usage_stats:
+                    total_input = usage_stats.get('prompt_tokens', 0)
+                    total_output = usage_stats.get('completion_tokens', 0)
+                    total_tokens = total_input + total_output
+
+                    if total_tokens >= context_size:
+                        err_msg = f"Error: Empty response — model likely ran out of context tokens ({total_tokens}/{context_size}). Consider increasing the context size or shortening the prompt."
+                        print_pg(err_msg, RED)
+                        return (err_msg, "")
+
+                print_pg("Warning: Empty response from server")
+                full_response = prompt
+
+            # Record token usage for the UI meter (read by PromptGeneratorPro.run).
+            self._pg_last_usage = {
+                "prompt": (usage_stats or {}).get("prompt_tokens", 0),
+                "completion": (usage_stats or {}).get("completion_tokens", 0),
+                "context": context_size,
+            }
+
+            # Stop server if requested
+            if stop_server_after:
+                self.stop_server()
+
+            return (full_response, thinking_content)
+
+        except comfy.model_management.InterruptProcessingException:
+            # User requested interrupt; ensure response is closed and optionally stop server
+            try:
+                response.close()
+            except Exception:
+                pass
+            if stop_server_after:
+                try:
+                    self.stop_server()
+                except Exception:
+                    pass
+            # Re-raise so ComfyUI handles the interruption
+            raise
+        except requests.exceptions.ConnectionError:
+            error_msg = f"Error: Could not connect to server at {full_url}. Server may have crashed."
+            print_pg(error_msg, RED)
+            raise RuntimeError(error_msg)
+        except requests.exceptions.Timeout:
+            error_msg = f"Error: Request timed out (>{req_timeout}s)"
+            print_pg(error_msg, RED)
+            raise RuntimeError(error_msg)
+        except Exception as e:
+            error_msg = f"Error: {e}"
+            print_pg(error_msg, RED)
+            if response is not None and response.status_code == 400:
+                print_pg("Perhaps your query requires a larger context size.\nConsider increasing it using the Generator Options node.", RED)
+                error_msg += "\nConsider increasing context size using Generator Options node."
+            raise RuntimeError(error_msg)
+        finally:
+            # Aggressive post-run cleanup to release VRAM pressure for Comfy pipelines.
+            if clear_vram_on_run:
+                self.flush_vram(unload_models=True)
+
+    # ================================================================
+    # Ollama generation helper
+    # ================================================================
+    def _generate_via_ollama(self, model_to_use, system_prompt, user_message,
+                             user_content, seed, enable_thinking,
+                             use_model_default_sampling, show_everything_in_console,
+                             stop_server_after, clear_vram_on_run, options, images, context_size, prompt,
+                             format_as_json):
+        """Generate text using Ollama's OpenAI-compatible endpoint with streaming."""
+
+        # Auto-start Ollama if it isn't running, so hitting Generate "just works". Launched
+        # silently (no terminal window) via the wrapper's CREATE_NO_WINDOW Popen.
+        try:
+            from ..py.ollama_wrapper import is_ollama_available, serve_ollama
+            if not is_ollama_available(_preferences_cache):
+                print_pg("Ollama not running — starting it (no window)…", YELLOW)
+                serve_ollama(_preferences_cache)
+        except Exception as _e:
+            print_pg(f"Could not auto-start Ollama: {_e}", RED)
+
+        # Omit the system message entirely when there is no system prompt.
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append(user_message)
+
+        # Per-node request timeout (seconds), shared with the llama.cpp path.
+        req_timeout = normalize_timeout(options.get("request_timeout") if options else None)
+
+        # Sampling parameters. Unified with the llama.cpp path: both backends fall back
+        # to the SAME baseline (get_model_defaults) so identical LLM Settings behave
+        # identically regardless of backend.
+        md = self.get_model_defaults()
+        temperature = md.get("temperature", 0.7)
+        top_k = md.get("top_k", 20)
+        top_p = md.get("top_p", 0.9)
+        min_p = md.get("min_p", 0.0)
+        repeat_penalty = md.get("repeat_penalty", 1.0)
+        presence_penalty = md.get("presence_penalty", 0.0)
+        if options and not use_model_default_sampling:
+            # Use the override only when it's actually a value (None means "not set",
+            # which would otherwise null out the local default).
+            def _ov(key, current):
+                v = options.get(key)
+                return current if v is None else v
+            temperature = _ov("temperature", temperature)
+            top_k = _ov("top_k", top_k)
+            top_p = _ov("top_p", top_p)
+            min_p = _ov("min_p", min_p)
+            repeat_penalty = _ov("repeat_penalty", repeat_penalty)
+            presence_penalty = _ov("presence_penalty", presence_penalty)
+
+        if show_everything_in_console:
+            print_pg(f"{'=' * 60}", GREEN)
+            print_pg("           DETAILED INFORMATION ENABLED (Ollama)", GREEN)
+            print_pg(f"{'=' * 60}", GREEN)
+            if not use_model_default_sampling:
+                print_pg("------ GENERATION PARAMETERS ------", GREEN)
+                for name, val in [("seed", seed), ("temperature", temperature),
+                                  ("top_k", top_k), ("top_p", top_p),
+                                  ("min_p", min_p), ("repeat_penalty", repeat_penalty)]:
+                    print_pg(f"{name} = {val}", GREEN)
+            else:
+                print_pg("Using model default sampling parameters", GREEN)
+            print_pg("\n--------- SYSTEM PROMPT ---------", GREEN)
+            print_pg(f"{system_prompt}", GREEN)
+            print_pg("\n--------- USER PROMPT ---------", GREEN)
+            print_pg(f"{user_content}", GREEN)
+
+        # Call Ollama (streaming)
+        result = ollama_generate_chat(
+            user_config=_preferences_cache,
+            model_name=model_to_use,
+            messages=messages,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+            repeat_penalty=repeat_penalty,
+            presence_penalty=presence_penalty,
+            seed=seed,
+            stream=True,
+            timeout=req_timeout,
+            use_model_defaults=use_model_default_sampling,
+            enable_thinking=enable_thinking,
+            format_as_json=format_as_json,
+        )
+
+        # result is (response_obj, error_msg) for streaming
+        if result[1] is not None:
+            print_pg(f"Ollama error: {result[1]}", RED)
+            return (result[1], "")
+
+        response = result[0]
+
+        try:
+            full_response, thinking_content, usage_stats = self._consume_chat_stream(
+                response, show_everything_in_console)
+            if show_everything_in_console:
+                print('')  # Final newline
+
+            if not show_everything_in_console:
+                print_pg("Prompt generation complete (Ollama).")
+
+            if show_everything_in_console and usage_stats:
+                self.print_token_stats(usage_stats, None, thinking_content, full_response, images)
+            else:
+                print_pg_footer()
+
+            if not full_response:
+                print_pg("Warning: Empty response from Ollama")
+                full_response = prompt
+
+            # "stop_server_after" → unload model from Ollama memory immediately
+            # (This overrides the keep_alive duration for this request)
+            if stop_server_after:
+                print_pg("Unloading model from Ollama memory...")
+                ok, msg = ollama_unload_model(_preferences_cache, model_to_use)
+                print_pg(msg, GREEN if ok else RED)
+            else:
+                keep_alive = _preferences_cache.get("ollama_keep_alive", "5m")
+                if keep_alive and str(keep_alive) != "0":
+                    print_pg(f"Model will stay loaded for: {keep_alive}")
+
+            # Record token usage for the UI meter (read by PromptGeneratorPro.run).
+            self._pg_last_usage = {
+                "prompt": (usage_stats or {}).get("prompt_tokens", 0),
+                "completion": (usage_stats or {}).get("completion_tokens", 0),
+                "context": context_size,
+            }
+
+            return (full_response, thinking_content)
+
+        except comfy.model_management.InterruptProcessingException:
+            try:
+                response.close()
+            except Exception:
+                pass
+            raise
+        except requests.exceptions.ConnectionError:
+            error_msg = "Error: Lost connection to Ollama during generation."
+            print_pg(error_msg, RED)
+            raise RuntimeError(error_msg)
+        except requests.exceptions.Timeout:
+            error_msg = f"Error: Ollama request timed out (>{req_timeout}s)"
+            print_pg(error_msg, RED)
+            raise RuntimeError(error_msg)
+        except Exception as e:
+            error_msg = f"Error (Ollama): {e}"
+            print_pg(error_msg, RED)
+            raise RuntimeError(error_msg)
+        finally:
+            # Aggressive post-run cleanup to release VRAM pressure for Comfy pipelines.
+            if clear_vram_on_run:
+                self.flush_vram(unload_models=True)
+
+    def print_token_stats(self, usage_stats, cached_token_counts, thinking_content, full_response, images):
+        """Print token statistics using pre-cached counts"""
+        print_pg(f"{'=' * 60}", GREEN)
+        print_pg("              TOKEN USAGE STATISTICS", GREEN)
+        print_pg(f"{'=' * 60}", GREEN)
+
+        total_input = usage_stats.get('prompt_tokens', 0) if usage_stats else 0
+        total_output = usage_stats.get('completion_tokens', 0) if usage_stats else 0
+
+        # Use cached token counts - handle None values
+        sys_tokens = cached_token_counts.get("system") if cached_token_counts else None
+        usr_tokens = cached_token_counts.get("user") if cached_token_counts else None
+
+        # Convert None to 0 for arithmetic, but track if we have valid counts
+        sys_tokens_val = sys_tokens if sys_tokens is not None else 0
+        usr_tokens_val = usr_tokens if usr_tokens is not None else 0
+
+        # Image tokens = total input - text tokens
+        text_tokens = sys_tokens_val + usr_tokens_val
+        image_tokens = max(0, total_input - text_tokens) if images else 0
+
+        # Output token split
+        think_len = len(thinking_content) if thinking_content else 0
+        ans_len = len(full_response) if full_response else 0
+        total_out_len = think_len + ans_len
+
+        if total_output > 0 and total_out_len > 0:
+            think_tokens = int(total_output * (think_len / total_out_len))
+            ans_tokens = total_output - think_tokens
+        else:
+            think_tokens = 0
+            ans_tokens = 0
+
+        # Display with "N/A" if tokenization failed
+        if sys_tokens is not None:
+            print_pg(f" SYSTEM PROMPT: {sys_tokens:>5} tokens", GREEN)
+        else:
+            print_pg(" SYSTEM PROMPT:   N/A (tokenization failed)", GREEN)
+
+        if usr_tokens is not None:
+            print_pg(f" USER PROMPT:   {usr_tokens:>5} tokens", GREEN)
+        else:
+            print_pg(" USER PROMPT:     N/A (tokenization failed)", GREEN)
+
+        if images and image_tokens > 0:
+            image_label = "image" if len(images) == 1 else "images"
+            print_pg(f" IMAGES:        {image_tokens:>5} tokens ({len(images)} {image_label})", GREEN)
+        print_pg(" -----------------------------------------", GREEN)
+        print_pg(f" THINKING:      {think_tokens:>5} tokens", GREEN)
+        print_pg(f" FINAL ANSWER:  {ans_tokens:>5} tokens", GREEN)
+        print_pg(" -----------------------------------------", GREEN)
+        print_pg(f" TOTAL:         {total_input + total_output:>5} tokens", GREEN)
+        print_pg(f"{'=' * 60}\n", GREEN)
+
+
+# --- Force-kill route: lets the "Force kill LLM Process" button hard-stop the server ---
+try:
+    import server as _pg_server
+
+    @_pg_server.PromptServer.instance.routes.post("/prompt-manager/force-kill-llm")
+    async def _force_kill_llm(request):
+        from aiohttp import web
+        try:
+            # Graceful stop first, then make sure nothing is left behind.
+            try:
+                PromptGenerator.stop_server()
+            except Exception as e:
+                print_pg(f"stop_server() during force-kill raised: {e}", YELLOW)
+            PromptGenerator.kill_all_llama_servers()
+            return web.json_response({"status": "ok", "message": "LLM process force-killed."})
+        except Exception as e:
+            return web.json_response({"status": "error", "message": str(e)}, status=500)
+except Exception as _e:
+    # If the server isn't available at import time, skip silently; button just won't work.
+    print_pg(f"Could not register force-kill route: {_e}", YELLOW)
+
+
+# NOTE: PromptGenerator is a logic base class, not a standalone node. The only registered
+# node is PromptGeneratorPro, wired in the package root __init__.py. (No mappings here.)

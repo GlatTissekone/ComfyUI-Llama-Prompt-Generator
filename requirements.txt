@@ -1,0 +1,6 @@
+requests
+huggingface_hub
+psutil
+tqdm
+Pillow
+colorama
